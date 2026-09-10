@@ -1,0 +1,38 @@
+{
+  "calibration_lightweight": {
+    "n_total": 921,
+    "n_used": 95,
+    "n_positive": 16,
+    "n_negative": 79,
+    "brier": 0.14893644281608545,
+    "log_loss": 0.4817900969953065,
+    "roc_auc": 0.5680379746835443,
+    "ece": 0.11274653809587072,
+    "accuracy": 0.8315789473684211,
+    "phase_III_brier": 0.17408591924968975,
+    "phase_III_accuracy": 0.7916666666666666
+  },
+  "toxicity_battery": {
+    "stupp_tmz_g3plus": 0.2315,
+    "stupp_heme": 0.14,
+    "pcv_g3plus": 0.6927,
+    "pcv_heme": 0.566,
+    "bevlom_g3plus": 0.7888
+  },
+  "isotonic_invariance": {
+    "brier_raw": 0.06549599163382873,
+    "brier_ood": 0.11920012448856923,
+    "n_knots": 3,
+    "transform_at_0.5": 1.0,
+    "transform_at_0.9": 1.0
+  },
+  "statistical_tests": {
+    "twoprop_p": 0.00016048539360685398,
+    "twoprop_effect": 0.25,
+    "bayes_p_gt": 1.0,
+    "bayes_mean": 0.45061557419383436,
+    "singlearm_p": 3.222167621941501e-12,
+    "logrank_hr": 0.6432994629172745,
+    "logrank_p": 0.007203690862531441
+  }
+}
