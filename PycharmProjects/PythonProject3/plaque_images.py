@@ -421,6 +421,17 @@ FOUNDATION_BACKBONES = {
             "dims": 1024, "gated": True,
             "timm_kwargs": {"init_values": 1e-5, "dynamic_img_size": True}},
 
+    # Tsinghua, ViT-S/B pretrained with DINO specifically on IHC and special
+    # stains (1.4M patches, 20k+ WSIs from the HISTAI database) rather than
+    # H&E - the first model in this registry trained predominantly on the
+    # same stain family as this project's DAB plaques, not H&E with IHC as a
+    # minority. Confirmed non-gated and working by direct test, not assumed
+    # from the model card. arXiv:2512.10326.
+    "stainnet":      {"backend": "timm", "repo": "hf-hub:JWonderLand/StainNet",
+                      "dims": 384, "gated": False, "timm_kwargs": {}},
+    "stainnet-base": {"backend": "timm", "repo": "hf-hub:JWonderLand/StainNet-Base",
+                      "dims": 768, "gated": False, "timm_kwargs": {}},
+
     # Mahmood Lab, ViT-H with 8 register tokens, successor to UNI. Gated:
     # https://huggingface.co/MahmoodLab/UNI2-h
     "uni2-h": {"backend": "timm", "repo": "hf-hub:MahmoodLab/UNI2-h",
@@ -928,6 +939,151 @@ def train_small_cnn(manifest: pd.DataFrame, epochs: int = 25, batch_size: int = 
         "message": (f"CNN from scratch: test BA {np.mean(fold_scores):.3f}, "
                     f"train BA {np.mean(train_scores):.3f}, gap {gap:+.3f}"
                     + ("  - memorising, as expected at this n." if gap > 0.2 else "")),
+    }
+
+
+# -------------------------
+# CONCH zero-shot (vision-language, optional - needs the `conch` package and
+# gated access to MahmoodLab/CONCH on Hugging Face)
+# -------------------------
+#
+# Every other model in this file produces an embedding that then needs a
+# classifier trained on this project's labels. CONCH is different: it was
+# trained to align image and text embeddings, so a class can be defined by a
+# text prompt alone and nothing here is fit to this project's 395 labels -
+# the comparison this enables is independent of every number elsewhere in
+# this module, which is also why no case-grouped CV is needed: there is no
+# training split to leak across.
+
+# A handful of phrasings per class (prompt ensembling - averaging several
+# captions' text embeddings is a standard way to reduce sensitivity to any
+# one wording, same idea as CLIP zero-shot classification generally).
+CONCH_PROMPTS = {
+    "cored": [
+        "a cored amyloid plaque with a dense compact core",
+        "a compact amyloid plaque with a dark central core",
+        "an amyloid beta plaque showing a dense, well-demarcated core",
+    ],
+    "diffuse": [
+        "a diffuse amyloid plaque with no dense core",
+        "a pale, loosely organised amyloid plaque without a core",
+        "an amyloid beta deposit with diffuse, ill-defined borders",
+    ],
+    "diffuse_core_partial": [
+        "an amyloid plaque with a partial or faint core",
+        "an amyloid plaque intermediate between diffuse and cored, with a small core",
+        "a mostly diffuse amyloid plaque with a small central condensation",
+    ],
+}
+
+
+def _load_conch(device: str | None = None):
+    """Load CONCH's vision-language model, transform and tokenizer."""
+    import torch
+    try:
+        from conch.open_clip_custom import create_model_from_pretrained, get_tokenizer
+    except ImportError:
+        raise ImportError("The conch package is required: "
+                          "pip install git+https://github.com/mahmoodlab/CONCH.git")
+
+    device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
+    try:
+        model, transform = create_model_from_pretrained(
+            "conch_ViT-B-16", "hf_hub:MahmoodLab/CONCH")
+    except Exception as e:
+        msg = str(e).lower()
+        if any(s in msg for s in ("401", "403", "gated", "restricted", "unauthorized")):
+            raise PermissionError(
+                "CONCH: access denied downloading MahmoodLab/CONCH. This model "
+                "is gated - request access at huggingface.co/MahmoodLab/CONCH "
+                "while logged in, then run `huggingface-cli login` and retry.") from e
+        raise
+    model = model.to(device).eval()
+    tokenizer = get_tokenizer()
+    return model, transform, tokenizer, device
+
+
+def conch_zero_shot(manifest: pd.DataFrame, prompts: dict[str, list[str]] = None,
+                    batch_size: int = 16, device: str | None = None,
+                    progress: bool = True) -> pd.DataFrame:
+    """
+    Classify each image in `manifest` by text-prompt similarity alone - no
+    fitting to this project's labels at any point.
+
+    Each class's prompt embeddings are averaged into one text vector per
+    class; a plaque's predicted class is whichever text vector its image
+    embedding is most similar to (cosine similarity, since both are
+    L2-normalised). Returns one row per plaque with the predicted label and
+    the raw per-class similarity scores, so confidence/margin can be read
+    the same way as a predict_proba output.
+    """
+    import torch
+    from conch.open_clip_custom import tokenize
+
+    prompts = prompts or CONCH_PROMPTS
+    model, transform, tokenizer, device = _load_conch(device)
+    classes = list(prompts.keys())
+
+    with torch.no_grad():
+        text_embs = []
+        for c in classes:
+            toks = tokenize(tokenizer, prompts[c]).to(device)
+            emb = model.encode_text(toks, normalize=True)  # (n_prompts, d)
+            text_embs.append(emb.mean(dim=0))  # average prompts, then this
+        text_embs = torch.stack(text_embs)  # (n_classes, d)
+        text_embs = text_embs / text_embs.norm(dim=-1, keepdim=True)
+
+    sims = []
+    with torch.no_grad():
+        for start in range(0, len(manifest), batch_size):
+            if progress and start % (batch_size * 5) == 0:
+                print(f"  {start}/{len(manifest)}", flush=True)
+            chunk = manifest["path"].iloc[start:start + batch_size]
+            images = torch.stack([transform(Image.open(p).convert("RGB")) for p in chunk]).to(device)
+            img_emb = model.encode_image(images, proj_contrast=True, normalize=True)
+            sims.append((img_emb @ text_embs.T).cpu().numpy())
+    sims = np.vstack(sims)
+
+    out = pd.DataFrame(sims, columns=[f"sim_{c}" for c in classes])
+    out["plaque_id"] = manifest["plaque_id"].values
+    out["predicted"] = [classes[i] for i in sims.argmax(axis=1)]
+    margin = np.sort(sims, axis=1)
+    out["margin"] = margin[:, -1] - margin[:, -2]
+    return out
+
+
+def evaluate_conch_zero_shot(manifest: pd.DataFrame, true_label_col: str = "label",
+                             prompts: dict[str, list[str]] = None,
+                             n_boot: int = 2000, seed: int = 0) -> dict:
+    """
+    Run conch_zero_shot() and score it against manifest's true labels.
+
+    A bootstrap CI over plaques, not a CV, because there is nothing fit to
+    this data to cross-validate - every prediction is already "held out" in
+    the sense that matters, so the only question is how much a different
+    sample of the same 395 plaques would move the estimate.
+    """
+    from sklearn.metrics import balanced_accuracy_score, f1_score
+
+    pred = conch_zero_shot(manifest, prompts=prompts)
+    y_true = manifest[true_label_col].values
+    y_pred = pred["predicted"].values
+
+    ba = balanced_accuracy_score(y_true, y_pred)
+    rng = np.random.default_rng(seed)
+    n = len(y_true)
+    boot = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        boot.append(balanced_accuracy_score(y_true[idx], y_pred[idx]))
+    lo, hi = np.percentile(boot, [2.5, 97.5])
+
+    return {
+        "balanced_accuracy": float(ba), "lo95": float(lo), "hi95": float(hi),
+        "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "predictions": pred,
+        "message": (f"CONCH zero-shot: balanced accuracy {ba:.3f} "
+                    f"[95% {lo:.3f}-{hi:.3f}], no training, n={n}"),
     }
 
 
