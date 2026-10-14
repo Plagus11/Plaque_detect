@@ -393,6 +393,19 @@ FOUNDATION_BACKBONES = {
     "phikon-v2": {"backend": "transformers", "repo": "owkin/phikon-v2",
                   "dims": 1024, "gated": False},
 
+    # Kaiko.ai, DINOv2 ViT-giant trained on only 12k TCGA WSIs (far less data
+    # than UNI/Virchow, competitive anyway per their paper). Fully open - MIT
+    # licensed, no HF login needed. Confirmed by direct inspection (not the
+    # model card's prose, which disagreed with itself on pooling/dims across
+    # sources): plain Dinov2Model, no register tokens, pooler_output is
+    # byte-identical to last_hidden_state[:, 0, :] (plain CLS token) - so no
+    # special "pool" mode is needed here, unlike Virchow2. No
+    # preprocessor_config.json on the repo, hence "image_size"/mean/std given
+    # explicitly for the manual-transform fallback in _build_foundation_model.
+    "midnight": {"backend": "transformers", "repo": "kaiko-ai/midnight",
+                 "dims": 1536, "gated": False, "image_size": 224,
+                 "mean": (0.5, 0.5, 0.5), "std": (0.5, 0.5, 0.5)},
+
     # Bioptimus, ViT-giant, trained on a large multi-site WSI corpus. Gated:
     # https://huggingface.co/bioptimus/H-optimus-0 - and uses its own
     # (non-ImageNet) normalisation statistics.
@@ -477,9 +490,28 @@ def _build_foundation_model(model_name: str):
 
     if spec["backend"] == "transformers":
         from transformers import AutoImageProcessor, AutoModel
-        processor = AutoImageProcessor.from_pretrained(spec["repo"])
         model = AutoModel.from_pretrained(spec["repo"])
         model.eval()
+        try:
+            processor = AutoImageProcessor.from_pretrained(spec["repo"])
+        except Exception:
+            # Some repos (e.g. kaiko-ai/midnight) ship weights with no
+            # preprocessor_config.json. Fall back to a manual transform using
+            # the mean/std/size the registry entry gives, wrapped so it is
+            # still called the same way: proc(images=[...], return_tensors="pt").
+            import torchvision.transforms as T
+            from transformers import BatchFeature
+            size = spec.get("image_size", 224)
+            mean, std = spec.get("mean", (0.5, 0.5, 0.5)), spec.get("std", (0.5, 0.5, 0.5))
+            tf = T.Compose([T.Resize((size, size)), T.ToTensor(), T.Normalize(mean, std)])
+
+            class _ManualProcessor:
+                def __call__(self, images, return_tensors="pt"):
+                    # BatchFeature (not a plain dict) so the caller's
+                    # `.to(device)` works the same as a real AutoImageProcessor.
+                    return BatchFeature(data={"pixel_values": torch.stack([tf(im) for im in images])})
+
+            processor = _ManualProcessor()
         return model, processor
 
     # backend == "timm"

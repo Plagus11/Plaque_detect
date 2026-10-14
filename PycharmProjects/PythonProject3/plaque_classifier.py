@@ -88,6 +88,14 @@ try:  # optional - better with correlated tabular features, but not required
 except Exception:  # pragma: no cover - depends on the local environment
     HAVE_LGBM = False
 
+try:  # optional - a tabular foundation model (in-context learning, no training
+      # loop of its own), worth trying precisely because this dataset is in its
+      # documented sweet spot: a few hundred rows, two dozen features.
+    from tabpfn import TabPFNClassifier
+    HAVE_TABPFN = True
+except Exception:  # pragma: no cover - depends on the local environment
+    HAVE_TABPFN = False
+
 # -------------------------
 # CONFIG
 # -------------------------
@@ -444,6 +452,35 @@ def _register_defaults() -> None:
             hidden_layer_sizes=(64, 32), alpha=1e-2, max_iter=600,
             early_stopping=False, random_state=seed),
         needs_scaling=True, description="small multilayer perceptron")
+
+    if HAVE_TABPFN:
+        # Pretrained once on millions of synthetic tabular tasks for in-context
+        # learning - no domain match to this pipeline's features is needed or
+        # possible, unlike the image foundation models. balance_probabilities
+        # mirrors class_weight="balanced" above; no needs_scaling, since
+        # TabPFN does its own internal preprocessing on raw features.
+        # device="cpu" is not optional on Apple Silicon: device="auto" picks
+        # mps, which segfaults (exit 139) on this model's forward pass -
+        # confirmed by reproducing the crash and fixing it with this one
+        # change, not a guess.
+        #
+        # Even on CPU, fitting on this project's real morphometric values
+        # (any subset, any single column) reliably segfaults on at least one
+        # Apple Silicon machine, while synthetic data of identical shape -
+        # including deliberately correlated synthetic data - does not. Ruled
+        # out by direct testing: NaN/inf, value scale, dtype, array
+        # contiguity, row/column count, n<p, specific rows vs. random
+        # subsets, multicollinearity, joint structure (survives a
+        # per-column shuffle), and both the v2 and v3.5 model checkpoints.
+        # Left registered since the bug is environment-specific, not a
+        # wiring mistake - skip "tabpfn" in `kinds` until it's fixed upstream
+        # or on a different machine.
+        register_model(
+            "tabpfn",
+            lambda seed: TabPFNClassifier(random_state=seed,
+                                          balance_probabilities=True,
+                                          device="cpu"),
+            description="TabPFN (pretrained tabular foundation model)")
 
     # The number every other model must beat. A classifier that cannot beat
     # "always predict the majority class" has learned nothing.
