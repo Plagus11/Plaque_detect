@@ -1,0 +1,13 @@
+vs,wilcoxon_stat,p_raw,p_holm,significant
+stainnet-base,7.0,1.0,1.0,False
+phikon,7.0,1.0,1.0,False
+stainnet,7.0,1.0,1.0,False
+lunit-dino,7.0,1.0,1.0,False
+uni2-h,5.0,0.625,1.0,False
+phikon-v2,5.0,0.625,1.0,False
+midnight,5.0,0.625,1.0,False
+googlenet,5.0,0.625,1.0,False
+resnet50,4.0,0.4375,1.0,False
+alexnet,2.0,0.1875,1.0,False
+virchow2,2.0,0.1875,1.0,False
+lunit-swav,1.0,0.125,1.0,False
