@@ -44,9 +44,11 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from sklearn.cluster import KMeans
+from sklearn.cluster import (KMeans, AgglomerativeClustering, SpectralClustering,
+                             DBSCAN, HDBSCAN)
 from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
+from sklearn.mixture import GaussianMixture
 from sklearn.metrics import (adjusted_mutual_info_score, adjusted_rand_score,
                              silhouette_score)
 from sklearn.pipeline import make_pipeline
@@ -58,6 +60,23 @@ FEATURES_CSV = "label_batch_multicase/label_batch_multicase_features.csv"
 LABELS_CSV = "labels_label_batch_multicase.csv"
 MAIN_CLASSES = ["diffuse", "cored", "diffuse_core_partial"]
 
+# Every entry takes (n_clusters, seed) and returns an unfitted estimator with
+# .fit_predict(X). All five make a different structural assumption about what
+# a "cluster" looks like - KMeans assumes round, similarly-sized blobs;
+# agglomerative (Ward) builds a hierarchy and cuts it; GMM allows elliptical,
+# overlapping, differently-sized clusters via soft assignment; spectral uses
+# a nearest-neighbour graph, so it can follow non-convex shapes. If the
+# labels only align with one of these, that is itself informative about what
+# shape the real structure has - or doesn't have.
+CLUSTER_METHODS = {
+    "kmeans": lambda k, seed: KMeans(n_clusters=k, n_init=10, random_state=seed),
+    "agglomerative": lambda k, seed: AgglomerativeClustering(n_clusters=k, linkage="ward"),
+    "gmm": lambda k, seed: GaussianMixture(n_components=k, random_state=seed, n_init=3),
+    "spectral": lambda k, seed: SpectralClustering(
+        n_clusters=k, random_state=seed, affinity="nearest_neighbors",
+        n_neighbors=10, assign_labels="kmeans"),
+}
+
 
 def _prep(X: pd.DataFrame) -> np.ndarray:
     return make_pipeline(SimpleImputer(strategy="median"),
@@ -66,7 +85,8 @@ def _prep(X: pd.DataFrame) -> np.ndarray:
 
 def cluster_unlabelled(features_csv: str | pd.DataFrame = FEATURES_CSV, n_clusters: int = 3,
                        features: list | None = None, seed: int = 0,
-                       exclude_cases: list | None = None) -> dict:
+                       exclude_cases: list | None = None,
+                       method: str = "kmeans") -> dict:
     """
     Cluster every detected plaque on morphology, ignoring labels entirely.
 
@@ -75,6 +95,8 @@ def cluster_unlabelled(features_csv: str | pd.DataFrame = FEATURES_CSV, n_cluste
     what to annotate. features_csv can be a path (the usual case) or an
     already-loaded DataFrame - e.g. from pc.load_detection_tables(), so the
     ~242k-row full dataset does not need writing to disk first.
+
+    method : any key of CLUSTER_METHODS - kmeans, agglomerative, gmm, spectral.
     """
     df = (features_csv if isinstance(features_csv, pd.DataFrame)
           else pc.load_features_only(features_csv))
@@ -82,9 +104,91 @@ def cluster_unlabelled(features_csv: str | pd.DataFrame = FEATURES_CSV, n_cluste
         df = df[~df["wsi_name"].isin(exclude_cases)].reset_index(drop=True)
     feats = [f for f in (features or pc.FEATURES) if f in df.columns]
     X = _prep(df[feats])
-    km = KMeans(n_clusters=n_clusters, n_init=10, random_state=seed).fit(X)
-    return {"df": df, "X": X, "features": feats, "model": km,
-            "cluster": km.labels_, "n_clusters": n_clusters}
+
+    factory = CLUSTER_METHODS.get(method)
+    if factory is None:
+        raise ValueError(f"Unknown method={method!r}. Available: {sorted(CLUSTER_METHODS)}")
+    model = factory(n_clusters, seed)
+    labels = model.fit_predict(X)
+    return {"df": df, "X": X, "features": feats, "model": model,
+            "cluster": labels, "n_clusters": n_clusters, "method": method}
+
+
+def cluster_density(features_csv: str | pd.DataFrame = FEATURES_CSV,
+                    method: str = "hdbscan", features: list | None = None,
+                    exclude_cases: list | None = None, **kwargs) -> dict:
+    """
+    DBSCAN/HDBSCAN - density-based, so unlike every method in CLUSTER_METHODS
+    it is not told how many clusters to find, and it can leave a plaque
+    unassigned (cluster label -1, "noise") rather than forcing it into one.
+    That makes it a genuinely different question from the k-based methods: not
+    "which k clusters best separate the labels" but "does label-aligned
+    structure stand out as dense regions at all, with no cluster count assumed."
+
+    kwargs go straight to DBSCAN (eps, min_samples) or HDBSCAN
+    (min_cluster_size, min_samples).
+    """
+    df = (features_csv if isinstance(features_csv, pd.DataFrame)
+          else pc.load_features_only(features_csv))
+    if exclude_cases:
+        df = df[~df["wsi_name"].isin(exclude_cases)].reset_index(drop=True)
+    feats = [f for f in (features or pc.FEATURES) if f in df.columns]
+    X = _prep(df[feats])
+
+    if method == "dbscan":
+        model = DBSCAN(**kwargs)
+    elif method == "hdbscan":
+        model = HDBSCAN(**kwargs)
+    else:
+        raise ValueError(f"Unknown method={method!r}. Available: dbscan, hdbscan")
+    labels = model.fit_predict(X)
+    n_noise = int((labels == -1).sum())
+    n_found = len(set(labels)) - (1 if -1 in labels else 0)
+    return {"df": df, "X": X, "features": feats, "model": model,
+            "cluster": labels, "n_clusters": n_found, "n_noise": n_noise,
+            "method": method}
+
+
+def sweep_density(features_csv: str | pd.DataFrame = FEATURES_CSV,
+                  labels_csv: str = LABELS_CSV, method: str = "hdbscan",
+                  param_grid: list[dict] | None = None,
+                  keep_classes: list | None = None,
+                  exclude_cases: list | None = None,
+                  features: list | None = None,
+                  silhouette_sample: int = 5000) -> pd.DataFrame:
+    """
+    Same idea as sweep(), but over density parameters instead of k, since
+    DBSCAN/HDBSCAN have no k to sweep. Rows where everything is noise (no
+    real clusters found) get ari=NaN rather than a misleading 0.
+    """
+    if param_grid is None:
+        param_grid = ([{"eps": e, "min_samples": 5} for e in (0.5, 1.0, 1.5, 2.0, 3.0)]
+                     if method == "dbscan" else
+                     [{"min_cluster_size": s} for s in (5, 10, 20, 30, 50)])
+
+    rows = []
+    for params in param_grid:
+        cl = cluster_density(features_csv, method=method, features=features,
+                             exclude_cases=exclude_cases, **params)
+        n_noise_frac = cl["n_noise"] / len(cl["cluster"])
+        if cl["n_clusters"] < 2:
+            rows.append({"method": method, **params, "n_clusters_found": cl["n_clusters"],
+                        "noise_frac": n_noise_frac, "ari": np.nan, "ami": np.nan,
+                        "purity": np.nan, "silhouette": np.nan, "n_labelled": 0})
+            continue
+        cmp_ = compare_to_labels(cl, labels_csv, keep_classes)
+        X, lab = cl["X"], cl["cluster"]
+        mask = lab != -1  # silhouette is undefined for noise-labelled points
+        sil = np.nan
+        if mask.sum() > silhouette_sample:
+            idx = np.random.default_rng(0).choice(np.where(mask)[0], silhouette_sample, replace=False)
+            sil = float(silhouette_score(X[idx], lab[idx]))
+        elif len(set(lab[mask])) > 1:
+            sil = float(silhouette_score(X[mask], lab[mask]))
+        rows.append({"method": method, **params, "n_clusters_found": cl["n_clusters"],
+                    "noise_frac": n_noise_frac, "ari": cmp_["ari"], "ami": cmp_["ami"],
+                    "purity": cmp_["purity"], "silhouette": sil, "n_labelled": cmp_["n"]})
+    return pd.DataFrame(rows)
 
 
 def compare_to_labels(clustered: dict, labels_csv: str = LABELS_CSV,
@@ -115,7 +219,8 @@ def compare_to_labels(clustered: dict, labels_csv: str = LABELS_CSV,
 def sweep(features_csv: str = FEATURES_CSV, labels_csv: str = LABELS_CSV,
           n_clusters=range(2, 9), keep_classes: list | None = None,
           exclude_cases: list | None = None, seed: int = 0,
-          silhouette_sample: int = 5000) -> pd.DataFrame:
+          silhouette_sample: int = 5000, features: list | None = None,
+          method: str = "kmeans") -> pd.DataFrame:
     """
     Agreement across a range of k, plus the silhouette of the clustering itself.
 
@@ -123,18 +228,24 @@ def sweep(features_csv: str = FEATURES_CSV, labels_csv: str = LABELS_CSV,
     peaks near the number of classes the annotator used, that is meaningful; if
     it is flat and near zero everywhere, the labels do not track the dominant
     structure in these features.
+
+    features : column names to cluster on, overriding the morphometric
+        default - e.g. image-embedding columns, so the same sweep/ARI/
+        permutation-null machinery works on pixel-derived structure too.
+    method : any key of CLUSTER_METHODS.
     """
     rows = []
     rng = np.random.default_rng(seed)
     for k in n_clusters:
         cl = cluster_unlabelled(features_csv, k, seed=seed,
-                                exclude_cases=exclude_cases)
+                                exclude_cases=exclude_cases, features=features,
+                                method=method)
         cmp_ = compare_to_labels(cl, labels_csv, keep_classes)
         X, lab = cl["X"], cl["cluster"]
         idx = (rng.choice(len(X), silhouette_sample, replace=False)
                if len(X) > silhouette_sample else np.arange(len(X)))
         sil = float(silhouette_score(X[idx], lab[idx]))
-        rows.append({"k": k, "ari": cmp_["ari"], "ami": cmp_["ami"],
+        rows.append({"method": method, "k": k, "ari": cmp_["ari"], "ami": cmp_["ami"],
                      "purity": cmp_["purity"], "silhouette": sil,
                      "n_labelled": cmp_["n"]})
     return pd.DataFrame(rows)
@@ -168,14 +279,15 @@ def label_permutation_null(clustered: dict, labels_csv: str = LABELS_CSV,
 
 def run(features_csv: str = FEATURES_CSV, labels_csv: str = LABELS_CSV,
         n_clusters=range(2, 9), keep_classes: list | None = None,
-        exclude_cases: list | None = None, seed: int = 0) -> dict:
+        exclude_cases: list | None = None, seed: int = 0,
+        features: list | None = None) -> dict:
     """Full comparison: sweep, best-k crosstab, and a permutation null."""
     keep_classes = keep_classes if keep_classes is not None else MAIN_CLASSES
     table = sweep(features_csv, labels_csv, n_clusters, keep_classes,
-                  exclude_cases, seed)
+                  exclude_cases, seed, features=features)
     best_k = int(table.loc[table["ari"].idxmax(), "k"])
     cl = cluster_unlabelled(features_csv, best_k, seed=seed,
-                            exclude_cases=exclude_cases)
+                            exclude_cases=exclude_cases, features=features)
     cmp_ = compare_to_labels(cl, labels_csv, keep_classes)
     perm = label_permutation_null(cl, labels_csv, keep_classes, seed=seed)
 
@@ -197,7 +309,7 @@ def run(features_csv: str = FEATURES_CSV, labels_csv: str = LABELS_CSV,
 
     lines = [
         f"Clustered {len(cl['df']):,} unlabelled plaques on {len(cl['features'])} "
-        f"morphometric features; compared against {cmp_['n']} labels.",
+        f"feature(s); compared against {cmp_['n']} labels.",
         "",
         table.round(3).to_string(index=False),
         "",
